@@ -8,20 +8,43 @@
     format: 'ranks',
     showMinMax: true
   };
-  
+
+  // Порядок важен: от старшего ранга к младшему, по нему идёт автоподбор.
+  const RANK_WEIGHTS = Object.freeze({ X: 256, S: 128, A: 16, B: 8, C: 4, D: 2, E: 1 });
+
+  // Разметка рангов не сверена с сайтом: селекторы взяты из userscript-версии.
+  const RANK_ELEMENTS_SELECTOR = '[data-rank], [data-card-rank], [class*="rank"]';
+  const RANK_CLASS_PATTERN = /(?:^|[\s_-])rank[-_]+([a-z0-9]+)(?=\s|$)/gi;
+  const RANK_TEXT_PATTERN = /ранг\s*[:—-]?\s*([a-z])\b/i;
+
+  const OBSERVER_DELAY_MS = 100;
+
   let currentConfig = { ...DEFAULT_CONFIG };
 
   function getConfig() {
     return currentConfig;
   }
 
-  function setConfigValue(key, value) {
-    currentConfig[key] = value;
-    chrome.storage.local.set({ mb_config: currentConfig });
+  function saveConfig(values) {
+    const next = { ...currentConfig, ...values };
+    chrome.storage.local.set({ mb_config: next });
+    applyConfig(next);
+  }
+
+  // Вызывается и при сохранении, и из onChanged, который срабатывает также в этой же вкладке.
+  // Сравнение не даёт перерисовать бейдж и повторить запрос дважды.
+  function applyConfig(values) {
+    const next = { ...DEFAULT_CONFIG, ...values };
+    if (JSON.stringify(next) === JSON.stringify(currentConfig)) return;
+    currentConfig = next;
+    CACHE.clear();
+    document.querySelectorAll('.mb-stats-badge').forEach((badge) => badge.remove());
+    handleModal();
   }
 
   // --- 2. Кэширование ---
   const CACHE = new Map();
+  const CACHE_LIMIT = 200;
 
   // --- 3. Стили ---
   const style = document.createElement('style');
@@ -153,6 +176,16 @@
     .mb-modal-row select:focus {
       border-color: #38bdf8;
     }
+    .mb-modal-check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 14px;
+      font-size: 12px;
+      color: #a1a1aa;
+      font-weight: 500;
+      cursor: pointer;
+    }
     .mb-save-btn {
       background: #8b5cf6;
       border: none;
@@ -170,40 +203,86 @@
   document.head.appendChild(style);
 
   // --- 4. Логика скрипта ---
-  function formatPoints(points, targetRank = 'S') {
-    if (!points && points !== 0) return '—';
-    const cfg = getConfig();
-    if (cfg.format === 'points') return `${points} pts`;
+  // Number() превращает null, '' и [] в 0, поэтому такие значения отсекаем заранее:
+  // пропавшая цена должна показываться как «—», а не как бесплатная карта.
+  function toFiniteNumber(value) {
+    if (typeof value !== 'number' && typeof value !== 'string') return null;
+    if (typeof value === 'string' && !value.trim()) return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
 
-    const RANK_WEIGHTS = { X: 256, S: 128, A: 16, B: 8, C: 4, D: 2, E: 1 };
-    const baseWeight = RANK_WEIGHTS[targetRank] || 128;
-    const count = points / baseWeight;
-    const formatted = Number.isInteger(count) ? count : Number(count.toFixed(2));
-    return `${formatted} ${targetRank}`;
+  function formatNumber(value) {
+    return String(Number(value.toFixed(2)));
+  }
+
+  function pickAutoRank(points) {
+    const match = Object.entries(RANK_WEIGHTS).find(([, weight]) => points / weight >= 1);
+    return match ? match[0] : null;
+  }
+
+  function formatPoints(rawPoints, targetRank = null) {
+    const points = toFiniteNumber(rawPoints);
+    if (points === null) return '—';
+    if (getConfig().format === 'points') return `${formatNumber(points)} pts`;
+
+    const rank = targetRank && points / RANK_WEIGHTS[targetRank] >= 0.01
+      ? targetRank
+      : pickAutoRank(points);
+    if (!rank) return `${formatNumber(points)} pts`;
+    return `${formatNumber(points / RANK_WEIGHTS[rank])} ${rank}`;
   }
 
   function detectCardRank(modal) {
-    // В расширении используем фоллбэк на S, если ранга нет в явном виде
-    return 'S';
+    const candidates = [];
+    for (const element of [modal, ...modal.querySelectorAll(RANK_ELEMENTS_SELECTOR)]) {
+      candidates.push(element.getAttribute('data-rank'), element.getAttribute('data-card-rank'));
+      const className = element.getAttribute('class') ?? '';
+      for (const [, token] of className.matchAll(RANK_CLASS_PATTERN)) candidates.push(token);
+    }
+    candidates.push(modal.textContent.match(RANK_TEXT_PATTERN)?.[1]);
+
+    // Проверка по таблице весов не даёт принять класс вроде «rank-up» за ранг.
+    for (const candidate of candidates) {
+      const rank = String(candidate ?? '').trim().toUpperCase();
+      if (rank && Object.hasOwn(RANK_WEIGHTS, rank)) return rank;
+    }
+    return null;
   }
 
-  async function fetchCardStats(cardId) {
-    const cfg = getConfig();
-    const cacheKey = `${cardId}_${cfg.period}_${cfg.source}`;
-    if (CACHE.has(cacheKey)) return CACHE.get(cacheKey);
-
+  async function requestCardStats(cardId, period, source) {
     try {
       // ИСПРАВЛЕНИЕ: Добавлен window.location.origin для расширений
-      const url = `${window.location.origin}/market/cards/${cardId}/price-history?days=${cfg.period}&source=${cfg.source}`;
-      const res = await fetch(url);
+      const url = `${window.location.origin}/market/cards/${cardId}/price-history?days=${period}&source=${source}`;
+      const options = {
+        headers: {
+          Accept: 'application/json',
+          'X-Requested-With': 'XMLHttpRequest'
+        }
+      };
+      const res = await fetch(url, options);
       if (!res.ok) return null;
-      const data = await res.json();
-      CACHE.set(cacheKey, data);
-      return data;
+      return await res.json();
     } catch (e) {
       console.error('[MangaBuff Plus] Ошибка API:', e);
       return null;
     }
+  }
+
+  function fetchCardStats(cardId) {
+    const cfg = getConfig();
+    const cacheKey = `${cardId}_${cfg.period}_${cfg.source}`;
+    if (CACHE.has(cacheKey)) return CACHE.get(cacheKey);
+
+    if (CACHE.size >= CACHE_LIMIT) CACHE.delete(CACHE.keys().next().value);
+
+    const promise = requestCardStats(cardId, cfg.period, cfg.source).then((data) => {
+      // Пока шёл запрос, кэш могли очистить и записать под этим ключом новый промис.
+      if (data === null && CACHE.get(cacheKey) === promise) CACHE.delete(cacheKey);
+      return data;
+    });
+    CACHE.set(cacheKey, promise);
+    return promise;
   }
 
   function openSettingsModal() {
@@ -240,47 +319,76 @@
             <option value="requests" ${cfg.source === 'requests' ? 'selected' : ''}>Только заявки</option>
           </select>
         </div>
+        <label class="mb-modal-check">
+          <input type="checkbox" id="mb-set-minmax" ${cfg.showMinMax ? 'checked' : ''}>
+          Показывать квартили (Q1 и Q3)
+        </label>
         <button class="mb-save-btn">Сохранить</button>
       </div>
     `;
     document.body.appendChild(overlay);
 
-    overlay.querySelector('.mb-modal-close').onclick = () => overlay.remove();
-    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+    // Иначе сайт примет клик по настройкам за клик мимо своей модалки и закроет её.
+    for (const type of ['mousedown', 'mouseup', 'pointerdown', 'pointerup', 'touchstart', 'touchend', 'click']) {
+      overlay.addEventListener(type, (e) => e.stopPropagation(), { passive: type.startsWith('touch') });
+    }
+
+    const closeOverlay = () => {
+      window.removeEventListener('keydown', onKeydown, true);
+      overlay.remove();
+    };
+
+    function onKeydown(e) {
+      if (e.key !== 'Escape') return;
+      // Перехват в фазе capture: иначе Esc закроет и модалку сайта под настройками.
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      closeOverlay();
+    }
+
+    window.addEventListener('keydown', onKeydown, true);
+
+    overlay.querySelector('.mb-modal-close').onclick = closeOverlay;
+    overlay.onclick = (e) => { if (e.target === overlay) closeOverlay(); };
 
     overlay.querySelector('.mb-save-btn').onclick = () => {
-      setConfigValue('period', parseInt(document.getElementById('mb-set-period').value, 10));
-      setConfigValue('format', document.getElementById('mb-set-format').value);
-      setConfigValue('source', document.getElementById('mb-set-source').value);
-      CACHE.clear();
-      overlay.remove();
-      const currentBadge = document.querySelector('.mb-stats-badge');
-      if (currentBadge) currentBadge.remove();
-      handleModal();
+      const values = {
+        period: parseInt(overlay.querySelector('#mb-set-period').value, 10),
+        format: overlay.querySelector('#mb-set-format').value,
+        source: overlay.querySelector('#mb-set-source').value,
+        showMinMax: overlay.querySelector('#mb-set-minmax').checked
+      };
+      closeOverlay();
+      saveConfig(values);
     };
   }
 
-  function createBadgeHtml(data, rank = 'S') {
+  function createBadgeHtml(data, rank = null) {
     const cfg = getConfig();
-    if (!data || !data.stats || !data.count) {
+    const period = toFiniteNumber(cfg.period) ?? '—';
+    const count = toFiniteNumber(data?.count);
+    if (!data || !data.stats || count === 0) {
       return `
         <div class="mb-stats-header">
-          <span class="mb-stats-title">Рынок (${cfg.period} дн.)</span>
+          <span class="mb-stats-title">Рынок (${period} дн.)</span>
           <button class="mb-settings-btn" title="Настройки">⚙</button>
         </div>
         <span style="color: #71717a; margin-top: 4px;">Нет данных</span>
       `;
     }
     const s = data.stats;
+    const quartiles = cfg.showMinMax ? `
+        <div class="mb-stat-item"><span class="mb-stat-label">Нижн. (Q1)</span><span class="mb-stat-val q1">${formatPoints(s.q1_points, rank)}</span></div>
+        <div class="mb-stat-item"><span class="mb-stat-label">Верхн. (Q3)</span><span class="mb-stat-val q3">${formatPoints(s.q3_points, rank)}</span></div>
+    ` : '';
     return `
       <div class="mb-stats-header">
-        <span class="mb-stats-title">Рынок (${cfg.period} дн.) • Сделок: ${data.count}</span>
+        <span class="mb-stats-title">Рынок (${period} дн.) • Сделок: ${count ?? '—'}</span>
         <button class="mb-settings-btn" title="Настройки">⚙</button>
       </div>
       <div class="mb-stats-grid">
         <div class="mb-stat-item"><span class="mb-stat-label">Медиана</span><span class="mb-stat-val">${formatPoints(s.median_points, rank)}</span></div>
-        <div class="mb-stat-item"><span class="mb-stat-label">Мин (Q1)</span><span class="mb-stat-val q1">${formatPoints(s.q1_points, rank)}</span></div>
-        <div class="mb-stat-item"><span class="mb-stat-label">Макс (Q3)</span><span class="mb-stat-val q3">${formatPoints(s.q3_points, rank)}</span></div>
+        ${quartiles}
       </div>
     `;
   }
@@ -299,8 +407,14 @@
     return null;
   }
 
+  // У элемента с position: fixed offsetParent равен null даже когда он виден,
+  // поэтому для такого случая дополнительно смотрим на getClientRects.
+  function isVisible(element) {
+    return element.offsetParent !== null || element.getClientRects().length > 0;
+  }
+
   async function handleModal() {
-    const modal = document.querySelector('.manga-cards__container');
+    const modal = [...document.querySelectorAll('.manga-cards__container')].find(isVisible);
     if (!modal) return;
 
     const cardId = extractBaseCardId(modal);
@@ -320,10 +434,12 @@
     badge.dataset.cardId = cardId;
     badge.innerHTML = `<span style="color: #a1a1aa;"> Загрузка...</span>`;
     
-    const insertBeforeEl = modal.querySelector('.manga-cards__controls') || targetContainer.firstChild;
+    const insertBeforeEl = targetContainer.querySelector(':scope > .manga-cards__controls') || targetContainer.firstChild;
     targetContainer.insertBefore(badge, insertBeforeEl);
 
     const data = await fetchCardStats(cardId);
+    // Пока шёл запрос, бейдж могли удалить: карту переключили или изменили настройки.
+    if (!badge.isConnected) return;
     badge.innerHTML = createBadgeHtml(data, detectCardRank(modal));
 
     const gearBtn = badge.querySelector('.mb-settings-btn');
@@ -331,12 +447,32 @@
   }
 
   // --- 5. Инициализация расширения ---
-  function initExtension() {
-    const observer = new MutationObserver(() => {
+  let observerTimer = null;
+
+  // Таймер не сбрасывается новыми мутациями: иначе постоянно меняющаяся страница
+  // откладывала бы вызов бесконечно.
+  function scheduleHandleModal() {
+    if (observerTimer !== null) return;
+    observerTimer = setTimeout(() => {
+      observerTimer = null;
       handleModal();
+    }, OBSERVER_DELAY_MS);
+  }
+
+  function initExtension() {
+    const observer = new MutationObserver(scheduleHandleModal);
+    // class и style нужны для п.10: скрытая модалка может показаться без изменения дерева.
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['class', 'style']
     });
-    observer.observe(document.body, { childList: true, subtree: true });
-    
+
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName === 'local' && changes.mb_config) applyConfig(changes.mb_config.newValue);
+    });
+
     // Проверка сразу при старте (если модалка уже была открыта)
     handleModal();
   }
